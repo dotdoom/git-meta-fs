@@ -36,15 +36,15 @@ fi
 # Logging
 #
 function info() {
-	echo "$0: $@"
+	echo "$0:" "$@"
 }
 
 function warn() {
-	info $@ >&1
+	info "$@" >&1
 }
 
 function die() {
-	warn $@
+	warn "$@"
 	exit 1
 }
 
@@ -118,6 +118,8 @@ function db_read() {
 # Save current filesystem state to git-meta-fs
 #
 function meta_commit() {
+	mkdir -p "$DB_ABS_DIR"
+
 	# retrieve current list of files with 'git ls-files'
 	local VERSIONED_LIST="$(make_temp)"
 	ls_all >"$VERSIONED_LIST"
@@ -218,18 +220,39 @@ function write_hook() {
 }
 
 function meta_init() {
-	write_hook pre-commit commit && write_hook post-merge merge
+	if [ -n "$DEVMODE" ]; then
+		write_hook pre-commit dev commit
+	else
+		write_hook pre-commit commit && write_hook post-merge merge
+	fi
 }
 
-function meta_init_dev() {
-	write_hook pre-commit dev commit
+function usage() {
+	cat <<INFO
+NAME
+	git-meta-fs - add file/directory owner and permission information to the git commit
+
+SYNOPSIS
+	$0 [ dev ] { commit | merge | init }
+
+DESCRIPTION
+	git-meta-fs is designed to be used as a Git hook. It stores and restores filesystem objects permission and ownership information.
+	The storage is a special directory $DB_REL_DIR which should be added to the source control.
+
+	To install the hooks use 'init' or 'dev init'. The first will install pre-commit and post-merge hooks which will store and restore all the information.
+	The latter only stores stubs for non-existing entries and does nothing for existing; this might be useful for a development system.
+
+	'commit' and 'merge' should be run from git hook, but you can use them directly to flush the database immediately.
+
+INFO
+	die 'command not specified'
 }
 
-[ $# -eq 1 ] || die "usage: $0 commit|merge|init|init-dev"
+[ $# -eq 1 ] || usage
 
 case "$1" in
-	commit|merge|init|init-dev)
-		meta_${1/-/_}
+	commit|merge|init)
+		meta_$1
 		;;
 	*)
 		die "unknown command: '$1'"
