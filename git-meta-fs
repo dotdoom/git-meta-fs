@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+
+# .git directory of the current repository
+GIT_DIR=$(git rev-parse --git-dir)
+[ -n "$GIT_DIR" ] || die "could not reach .git directory"
+
+# root directory of the current repository
+GIT_ROOT=$(git rev-parse --show-toplevel)
+[ -n "$GIT_ROOT" ] || die "could not reach git repository root"
+
+# metafs database file: relative to repository root path
+DB_REL_DIR=.gitmetafs
+
+# absolute db path
+DB_ABS_DIR="$GIT_ROOT/$DB_REL_DIR"
+
+# placeholder file for git to keep directory
+# and git-meta-fs to save dir mode to
+DIR_PLACEHOLDER_FILE=".git-meta-fs-directory-placeholder"
+
+# script filename
+SELF="$( (cd `dirname "$0"`; pwd -P) )/$(basename "$0")"
+
+# OS type
+OS="$(uname -s)"
+
+# default file mode (used as a placeholder for dev mode)
+DEFAULT_FILEMODE="0000 nobody:nobody"
+
+if [ "$1" = "dev" ]; then
+	DEVMODE=yes
+	shift
+fi
+
+#
+# Logging
+#
+function info() {
+	echo "$0: $@"
+}
+
+function warn() {
+	info $@ >&1
+}
+
+function die() {
+	warn $@
+	exit 1
+}
+
+#
+# Git file listing
+#
+function ls_files() {
+	git ls-files --full-name -- "$GIT_ROOT" | grep -Fv "$DB_REL_DIR"
+}
+
+function ls_all() {
+	# First create a directory listing because Git won't list directory names separately
+	ls_files | while read filename; do
+		dirname $filename
+	done | sort -u
+
+	# Now list all the files
+	ls_files
+}
+
+#
+# Portability
+#
+function make_temp() {
+	if [ "$OS" = "Linux" ]; then
+		mktemp
+	else
+		mktemp -t git_meta_fs
+	fi
+}
+
+#
+# Database helper functions
+#
+
+function _db_real_file() {
+	FILENAME="${1:1}"
+	echo "${FILENAME//%//}"
+}
+
+function _db_data_file() {
+	echo "%${1//\//%}"
+}
+
+function db_ls() {
+	pushd "$DB_ABS_DIR" &>/dev/null || die "could not switch to meta-dump directory."
+		find . | while read -r filename; do
+			# do not forget to remove first 2 chars (./) from $filename (added by find)
+			local repo_filename="$(_db_real_file "${filename:2}")"
+			[ -n "$repo_filename" ] && echo "$repo_filename"
+		done
+		popd &>/dev/null
+}
+
+function db_delete() {
+	local db_filename="$DB_ABS_DIR/$(_db_data_file "$1")"
+	git rm -rf "$db_filename"
+}
+
+function db_write() {
+	local db_filename="$DB_ABS_DIR/$(_db_data_file "$1" 1)"
+	echo "$2" >"$db_filename"
+}
+
+function db_read() {
+	local db_filename="$DB_ABS_DIR/$(_db_data_file "$1")"
+	cat "$db_filename" 2>/dev/null
+}
+
+#
+# Save current filesystem state to git-meta-fs
+#
+function meta_commit() {
+	# retrieve current list of files with 'git ls-files'
+	local VERSIONED_LIST="$(make_temp)"
+	ls_all >"$VERSIONED_LIST"
+
+	# first remove files not listed in current listing
+	local removed_files_count=0
+	db_ls | while read -r filename; do
+		if ! grep -Fq "$filename" "$VERSIONED_LIST"; then
+			info "$filename -> /dev/null"
+			db_delete "$filename"
+			let removed_files_count=$removed_files_count+1
+		fi
+	done
+	[ -n "$DEVMODE" ] && [ $removed_files_count -gt 0 ] && info "$removed_files_count files were unversioned"
+
+	# collect arguments for stat(1)
+	local stat_format_arg='-f'
+	local stat_format_fields='%OMp%OLp|%Su:%Sg,%u:%g'
+	if [ "$OS" = "Linux" ]; then
+		stat_format_arg='--printf'
+		stat_format_fields='%.4a|%U:%G,%u:%g\n'
+	fi
+
+	# now collect status of versioned files
+	local added_files_count=0
+	while read -r filename; do
+		[ -e "$filename" ] || continue # untracked deletion
+		if [ -z "$DEVMODE" ]; then
+			local filemode="$(/usr/bin/stat $stat_format_arg "$stat_format_fields" "$GIT_ROOT/$filename")"
+
+			local fm_mode="${filemode/|*/}"
+			local fm_ownership="${filemode/*|/}"
+
+			local fm_owner_ids="${fm_ownership/*,/}"
+			local fm_uid=${fm_owner_ids/:*/}
+			local fm_gid=${fm_owner_ids/*:/}
+
+			local fm_owner_strs="${fm_ownership/,*/}"
+			local fm_user="${fm_owner_strs/:*/}"
+			local fm_group="${fm_owner_strs/*:/}"
+			
+			if [ -L "$GIT_ROOT/$filename" ]; then
+				filemode="0777" # let's follow Linux in this regard
+			else
+				filemode="$fm_mode"
+			fi
+			if [ $fm_uid -eq 0 ] || [ $fm_uid -eq 65534 ]; then
+				filemode="$filemode $fm_uid"
+			else
+				filemode="$filemode $fm_user"
+			fi
+
+			if [ $fm_gid -eq 0 ] || [ $fm_uid -eq 65534 ]; then
+				filemode="$filemode:$fm_gid"
+			else
+				filemode="$filemode:$fm_group"
+			fi
+		else
+			local filemode="$DEFAULT_FILEMODE"
+		fi
+
+		local old_filemode="$(db_read "$filename")"
+		if [ "$old_filemode" != "$filemode" ]; then
+			if [ -z "$DEVMODE" ]; then
+				[ -z "$old_filemode" ] && old_filemode='new file'
+				info "$filename: $old_filemode -> $filemode"
+				db_write "$filename" "$filemode"
+			elif [ -z "$old_filemode" ]; then
+				let added_files_count=$added_files_count+1
+				warn "new file '$filename' found, setting temporary mode '$filemode'"
+				db_write "$filename" "$filemode"
+			fi
+		fi
+	done <"$VERSIONED_LIST"
+	[ -n "$DEVMODE" ] && [ $added_files_count -gt 0 ] && info "$added_files_count new files were versioned"
+
+	rm -f "$VERSIONED_LIST"
+	git add -f "$DB_ABS_DIR"
+}
+
+#
+# Apply git-meta-fs settings to the filesystem
+#
+function meta_merge() {
+	db_ls | while read -r filename; do
+		filemode="$(db_read "$filename")"
+		chmod ${filemode/ */} "$GIT_ROOT/$filename"
+		chown ${filemode/* /} "$GIT_ROOT/$filename"
+	done
+}
+
+function write_hook() {
+	local hook_path="$GIT_DIR/hooks/$1"
+	shift
+	[ -e "$hook_path" ] || echo "#!/bin/sh" >"$hook_path"
+	grep -q 'git-meta-fs' "$hook_path" || echo "$SELF $* # launch git-meta-fs" >>"$hook_path"
+	chmod u+x "$hook_path"
+}
+
+function meta_init() {
+	write_hook pre-commit commit && write_hook post-merge merge
+}
+
+function meta_init_dev() {
+	write_hook pre-commit dev commit
+}
+
+[ $# -eq 1 ] || die "usage: $0 commit|merge|init|init-dev"
+
+case "$1" in
+	commit|merge|init|init-dev)
+		meta_${1/-/_}
+		;;
+	*)
+		die "unknown command: '$1'"
+		;;
+esac
