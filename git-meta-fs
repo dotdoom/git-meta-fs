@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
 # .git directory of the current repository
-GIT_DIR=$(git rev-parse --git-dir)
+GIT_DIR=$(git rev-parse --git-dir )
 [ -n "$GIT_DIR" ] || die "could not reach .git directory"
 
 # root directory of the current repository
-GIT_ROOT=$(git rev-parse --show-toplevel)
+GIT_ROOT=$(git rev-parse --show-toplevel )
 [ -n "$GIT_ROOT" ] || die "could not reach git repository root"
 
 # metafs database file: relative to repository root path
@@ -13,10 +13,6 @@ DB_REL_DIR=.gitmetafs
 
 # absolute db path
 DB_ABS_DIR="$GIT_ROOT/$DB_REL_DIR"
-
-# placeholder file for git to keep directory
-# and git-meta-fs to save dir mode to
-DIR_PLACEHOLDER_FILE=".git-meta-fs-directory-placeholder"
 
 # script filename
 SELF="$( (cd `dirname "$0"`; pwd -P) )/$(basename "$0")"
@@ -79,7 +75,6 @@ function make_temp() {
 #
 # Database helper functions
 #
-
 function _db_real_file() {
 	FILENAME="${1:1}"
 	echo "${FILENAME//%//}"
@@ -127,7 +122,7 @@ function meta_commit() {
 	# first remove files not listed in current listing
 	local removed_files_count=0
 	db_ls | while read -r filename; do
-		if ! grep -Fq "$filename" "$VERSIONED_LIST"; then
+		if ! grep -Fxq "$filename" "$VERSIONED_LIST"; then
 			info "$filename -> /dev/null"
 			db_delete "$filename"
 			let removed_files_count=$removed_files_count+1
@@ -240,9 +235,9 @@ DESCRIPTION
 	The storage is a special directory $DB_REL_DIR which should be added to the source control.
 
 	To install the hooks use 'init' or 'dev init'. The first will install pre-commit and post-merge hooks which will store and restore all the information.
-	The latter only stores stubs for non-existing entries and does nothing for existing; this might be useful for a development system.
+	The latter installs hook that only stores stubs for non-existing entries and does nothing for existing; this might be useful for a development system.
 
-	'commit' and 'merge' should be run from git hook, but you can use them directly to flush the database immediately.
+	'commit' and 'merge' should be run from the corresponding git hooks, but you can use them directly to flush the database immediately.
 
 INFO
 	die 'command not specified'
