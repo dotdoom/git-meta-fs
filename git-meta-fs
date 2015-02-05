@@ -1,27 +1,24 @@
 #!/usr/bin/env bash
 
 # .git directory of the current repository
-GIT_DIR=$(git rev-parse --git-dir )
+GIT_DIR=$(git rev-parse --git-dir)
 [ -n "$GIT_DIR" ] || die "could not reach .git directory"
 
 # root directory of the current repository
-GIT_ROOT=$(git rev-parse --show-toplevel )
+GIT_ROOT=$(git rev-parse --show-toplevel)
 [ -n "$GIT_ROOT" ] || die "could not reach git repository root"
 
 # metafs database file: relative to repository root path
 DB_REL_DIR=.gitmetafs
 
 # absolute db path
-DB_ABS_DIR="$GIT_ROOT/$DB_REL_DIR"
+DB_ABS_DIR="$(readlink -m "$GIT_ROOT/$DB_REL_DIR")"
 
 # script filename
 SELF="$( (cd `dirname "$0"`; pwd -P) )/$(basename "$0")"
 
-# OS type
-OS="$(uname -s)"
-
-# default file mode (used as a placeholder for dev mode)
-DEFAULT_FILEMODE="0000 nobody:nobody"
+# development mode ownership information
+DEVMODE_OWNER='root:root'
 
 if [ "$1" = "dev" ]; then
 	DEVMODE=yes
@@ -62,26 +59,14 @@ function ls_all() {
 }
 
 #
-# Portability
-#
-function make_temp() {
-	if [ "$OS" = "Linux" ]; then
-		mktemp
-	else
-		mktemp -t git_meta_fs
-	fi
-}
-
-#
 # Database helper functions
 #
 function _db_real_file() {
-	FILENAME="${1:1}"
-	echo "${FILENAME//%//}"
+	echo "$(echo "$1" | base64 -d)"
 }
 
 function _db_data_file() {
-	echo "%${1//\//%}"
+	echo "$(echo "$1" | base64)"
 }
 
 function db_ls() {
@@ -96,11 +81,10 @@ function db_ls() {
 
 function db_delete() {
 	local db_filename="$DB_ABS_DIR/$(_db_data_file "$1")"
-	git rm -rf "$db_filename"
 }
 
 function db_write() {
-	local db_filename="$DB_ABS_DIR/$(_db_data_file "$1" 1)"
+	local db_filename="$DB_ABS_DIR/$(_db_data_file "$1")"
 	echo "$2" >"$db_filename"
 }
 
@@ -116,64 +100,26 @@ function meta_commit() {
 	mkdir -p "$DB_ABS_DIR"
 
 	# retrieve current list of files with 'git ls-files'
-	local VERSIONED_LIST="$(make_temp)"
+	local VERSIONED_LIST="$(mktemp)"
 	ls_all >"$VERSIONED_LIST"
 
 	# first remove files not listed in current listing
 	local removed_files_count=0
-	db_ls | while read -r filename; do
-		if ! grep -Fxq "$filename" "$VERSIONED_LIST"; then
-			info "$filename -> /dev/null"
-			db_delete "$filename"
-			let removed_files_count=$removed_files_count+1
-		fi
+	db_ls | grep -Fvxqf "$VERSIONED_LIST" | while read -r filename; do
+		info "$filename -> /dev/null"
+		db_delete "$filename"
+		let removed_files_count=$removed_files_count+1
 	done
 	[ -n "$DEVMODE" ] && [ $removed_files_count -gt 0 ] && info "$removed_files_count files were unversioned"
-
-	# collect arguments for stat(1)
-	local stat_format_arg='-f'
-	local stat_format_fields='%OMp%OLp|%Su:%Sg,%u:%g'
-	if [ "$OS" = "Linux" ]; then
-		stat_format_arg='--printf'
-		stat_format_fields='%.4a|%U:%G,%u:%g\n'
-	fi
 
 	# now collect status of versioned files
 	local added_files_count=0
 	while read -r filename; do
 		[ -e "$filename" ] || continue # untracked deletion
 		if [ -z "$DEVMODE" ]; then
-			local filemode="$(/usr/bin/stat $stat_format_arg "$stat_format_fields" "$GIT_ROOT/$filename")"
-
-			local fm_mode="${filemode/|*/}"
-			local fm_ownership="${filemode/*|/}"
-
-			local fm_owner_ids="${fm_ownership/*,/}"
-			local fm_uid=${fm_owner_ids/:*/}
-			local fm_gid=${fm_owner_ids/*:/}
-
-			local fm_owner_strs="${fm_ownership/,*/}"
-			local fm_user="${fm_owner_strs/:*/}"
-			local fm_group="${fm_owner_strs/*:/}"
-			
-			if [ -L "$GIT_ROOT/$filename" ]; then
-				filemode="0777" # let's follow Linux in this regard
-			else
-				filemode="$fm_mode"
-			fi
-			if [ $fm_uid -eq 0 ] || [ $fm_uid -eq 65534 ]; then
-				filemode="$filemode $fm_uid"
-			else
-				filemode="$filemode $fm_user"
-			fi
-
-			if [ $fm_gid -eq 0 ] || [ $fm_uid -eq 65534 ]; then
-				filemode="$filemode:$fm_gid"
-			else
-				filemode="$filemode:$fm_group"
-			fi
+			local filemode="$(/usr/bin/stat --printf '%.4a %U:%G' "$filename")"
 		else
-			local filemode="$DEFAULT_FILEMODE"
+			local filemode="$(/usr/bin/stat --printf '%.4a ' "$filename")$DEVMODE_OWNER"
 		fi
 
 		local old_filemode="$(db_read "$filename")"
@@ -184,7 +130,7 @@ function meta_commit() {
 				db_write "$filename" "$filemode"
 			elif [ -z "$old_filemode" ]; then
 				let added_files_count=$added_files_count+1
-				warn "new file '$filename' found, setting temporary mode '$filemode'"
+				warn "new file '$filename' found [$(_db_data_file "$filename")], setting temporary mode '$filemode'"
 				db_write "$filename" "$filemode"
 			fi
 		fi
@@ -192,7 +138,7 @@ function meta_commit() {
 	[ -n "$DEVMODE" ] && [ $added_files_count -gt 0 ] && info "$added_files_count new files were versioned"
 
 	rm -f "$VERSIONED_LIST"
-	git add -f "$DB_ABS_DIR"
+	git add --all -f "$DB_ABS_DIR"
 }
 
 #
