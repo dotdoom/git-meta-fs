@@ -97,7 +97,7 @@ function db_read() {
 # Save current filesystem state to git-meta-fs
 #
 function meta_commit() {
-	mkdir -p "$DB_ABS_DIR"
+	mkdir -m 0700 -p "$DB_ABS_DIR"
 
 	# retrieve current list of files with 'git ls-files'
 	local VERSIONED_LIST="$(mktemp)"
