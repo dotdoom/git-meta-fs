@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 
 # .git directory of the current repository
-GIT_DIR=$(git rev-parse --git-dir)
-[ -n "$GIT_DIR" ] || die "could not reach .git directory"
+GIT_DATA_DIR=$(git rev-parse --git-dir)
+[ -n "$GIT_DATA_DIR" ] || die "Could not reach .git directory"
 
 # root directory of the current repository
 GIT_ROOT=$(git rev-parse --show-toplevel)
-[ -n "$GIT_ROOT" ] || die "could not reach git repository root"
+[ -n "$GIT_ROOT" ] || die "Could not reach git repository root"
 
 # metafs database file: relative to repository root path
 DB_REL_DIR=.gitmetafs
@@ -16,14 +16,6 @@ DB_ABS_DIR="$(readlink -m "$GIT_ROOT/$DB_REL_DIR")"
 
 # script filename
 SELF="$( (cd `dirname "$0"`; pwd -P) )/$(basename "$0")"
-
-# development mode ownership information
-DEVMODE_OWNER='root:root'
-
-if [ "$1" = "dev" ]; then
-	DEVMODE=yes
-	shift
-fi
 
 #
 # Logging
@@ -70,7 +62,7 @@ function _db_data_file() {
 }
 
 function db_ls() {
-	pushd "$DB_ABS_DIR" &>/dev/null || die "could not switch to meta-dump directory."
+	pushd "$DB_ABS_DIR" &>/dev/null || die "Could not switch to meta-dump directory."
 		find . | while read -r filename; do
 			# do not forget to remove first 2 chars (./) from $filename (added by find)
 			local repo_filename="$(_db_real_file "${filename:2}")"
@@ -93,10 +85,8 @@ function db_read() {
 	cat "$db_filename" 2>/dev/null
 }
 
-#
-# Save current filesystem state to git-meta-fs
-#
-function meta_commit() {
+# build current permissions database tree in $DB_ABS_DIR
+function build_tree() {
 	mkdir -m 0700 -p "$DB_ABS_DIR"
 
 	# retrieve current list of files with 'git ls-files'
@@ -110,34 +100,32 @@ function meta_commit() {
 		db_delete "$filename"
 		let removed_files_count=$removed_files_count+1
 	done
-	[ -n "$DEVMODE" ] && [ $removed_files_count -gt 0 ] && info "$removed_files_count files were unversioned"
+	[ $removed_files_count -gt 0 ] && info "$removed_files_count files were unversioned"
 
 	# now collect status of versioned files
 	local added_files_count=0
 	while read -r filename; do
 		[ -e "$filename" ] || continue # untracked deletion
-		if [ -z "$DEVMODE" ]; then
-			local filemode="$(/usr/bin/stat --printf '%.4a %U:%G' "$filename")"
-		else
-			local filemode="$(/usr/bin/stat --printf '%.4a ' "$filename")$DEVMODE_OWNER"
-		fi
 
 		local old_filemode="$(db_read "$filename")"
+		local filemode="$(/usr/bin/stat --printf '%.4a %U:%G' "$filename")"
+
 		if [ "$old_filemode" != "$filemode" ]; then
-			if [ -z "$DEVMODE" ]; then
-				[ -z "$old_filemode" ] && old_filemode='new file'
-				info "$filename: $old_filemode -> $filemode"
-				db_write "$filename" "$filemode"
-			elif [ -z "$old_filemode" ]; then
-				let added_files_count=$added_files_count+1
-				warn "new file '$filename' found [$(_db_data_file "$filename")], setting temporary mode '$filemode'"
-				db_write "$filename" "$filemode"
-			fi
+			[ -z "$old_filemode" ] && old_filemode='new file'
+			info "$filename: $old_filemode -> $filemode"
+			db_write "$filename" "$filemode"
 		fi
 	done <"$VERSIONED_LIST"
-	[ -n "$DEVMODE" ] && [ $added_files_count -gt 0 ] && info "$added_files_count new files were versioned"
+	[ $added_files_count -gt 0 ] && info "$added_files_count new files were versioned"
 
 	rm -f "$VERSIONED_LIST"
+}
+
+#
+# Save current filesystem state to git-meta-fs
+#
+function meta_commit() {
+	build_tree
 	git add --all -f "$DB_ABS_DIR"
 }
 
@@ -145,15 +133,68 @@ function meta_commit() {
 # Apply git-meta-fs settings to the filesystem
 #
 function meta_merge() {
+	local filename filemode
 	db_ls | while read -r filename; do
 		filemode="$(db_read "$filename")"
-		chmod ${filemode/ */} "$GIT_ROOT/$filename"
-		chown ${filemode/* /} "$GIT_ROOT/$filename"
+		if [ -z "$filemode" ]; then
+			die "No file mode for $filename"
+		else
+			filename="$GIT_ROOT/$filename"
+			if [ -e "$filename" ]; then
+				chmod ${filemode/ */} "$filename"
+				chown ${filemode/* /} "$filename"
+			else
+				die "No file for $filename ($filemode)"
+			fi
+		fi
 	done
 }
 
+#
+# Show differencies between commits or a commit and current state
+#
+function meta_diff() {
+	local include_tree_diff
+	if [ "$1" = "-a" ]; then
+		include_tree_diff=1
+		shift
+	fi
+
+	build_tree >/dev/null
+	git diff --exit-code "$@" -- "$DB_ABS_DIR" | INCLUDE_TREE_DIFF=$include_tree_diff perl -MMIME::Base64 -e '
+		my $filename, $print, $print_override = $ENV{"INCLUDE_TREE_DIFF"};
+		while (<>) {
+			if ($_ =~ /^(---|\+\+\+) .*\/(.*)/) {
+				if ($1 eq "---") {
+					if ($2 eq "null") {
+						$print = 0;
+					} else {
+						$filename = $2;
+						$print = 1;
+					}
+				} else {
+					if ($2 eq "null") {
+						$print = 0;
+					} else {
+						$filename = $2;
+					}
+
+					if ($print || $print_override) {
+						print "/" . decode_base64($filename);
+					}
+				}
+			} elsif ($_ =~ /^(-|\+)/) {
+				if ($print || $print_override) {
+					print $_;
+				}
+			}
+		}' | $PAGER
+
+	return ${PIPESTATUS[0]}
+}
+
 function write_hook() {
-	local hook_path="$GIT_DIR/hooks/$1"
+	local hook_path="$GIT_DATA_DIR/hooks/$1"
 	shift
 	[ -e "$hook_path" ] || echo "#!/bin/sh" >"$hook_path"
 	grep -q 'git-meta-fs' "$hook_path" || echo "$SELF $* # launch git-meta-fs" >>"$hook_path"
@@ -161,11 +202,7 @@ function write_hook() {
 }
 
 function meta_init() {
-	if [ -n "$DEVMODE" ]; then
-		write_hook pre-commit dev commit
-	else
-		write_hook pre-commit commit && write_hook post-merge merge
-	fi
+	write_hook pre-commit commit && write_hook post-merge merge
 }
 
 function usage() {
@@ -174,28 +211,45 @@ NAME
 	git-meta-fs - add file/directory owner and permission information to the git commit
 
 SYNOPSIS
-	$0 [ dev ] { commit | merge | init }
+	$0 init
+	$0 diff [-a] [ rev1 [ rev2 ] ]
+	$0 status
 
 DESCRIPTION
 	git-meta-fs is designed to be used as a Git hook. It stores and restores filesystem objects permission and ownership information.
 	The storage is a special directory $DB_REL_DIR which should be added to the source control.
 
-	To install the hooks use 'init' or 'dev init'. The first will install pre-commit and post-merge hooks which will store and restore all the information.
-	The latter installs hook that only stores stubs for non-existing entries and does nothing for existing; this might be useful for a development system.
+	To install the hooks use 'init'. It will install pre-commit and post-merge hooks which will store and restore all the information.
 
-	'commit' and 'merge' should be run from the corresponding git hooks, but you can use them directly to flush the database immediately.
+	Use 'diff' to find the differencies between staged, unstaged and commits (branches, tags). Note: this is not in a unified diff format.
+	The '-a' flag shows the file names which are not present in both trees.
 
+	'status' is an alias for 'diff -a HEAD'
 INFO
-	die 'command not specified'
+
+	die 'Command not specified'
 }
 
-[ $# -eq 1 ] || usage
-
+[ $# -gt 0 ] || usage
 case "$1" in
-	commit|merge|init)
+	commit|merge)
+		[ $# -eq 1 ] || usage
+		[ -z "$GIT_DIR" ] && warn "Looks like $1 command is not called from the git hook!"
 		meta_$1
 		;;
+	init)
+		[ $# -eq 1 ] || usage
+		meta_$1
+		;;
+	diff)
+		shift
+		meta_diff "$@"
+		;;
+	status)
+		[ $# -eq 1 ] || usage
+		meta_diff -a HEAD
+		;;
 	*)
-		die "unknown command: '$1'"
+		die "Unknown command: '$1'"
 		;;
 esac
