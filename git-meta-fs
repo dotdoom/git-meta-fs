@@ -73,6 +73,7 @@ function db_ls() {
 
 function db_delete() {
 	local db_filename="$DB_ABS_DIR/$(_db_data_file "$1")"
+	git rm -rf "$db_filename"
 }
 
 function db_write() {
@@ -95,7 +96,7 @@ function build_tree() {
 
 	# first remove files not listed in current listing
 	local removed_files_count=0
-	db_ls | grep -Fvxqf "$VERSIONED_LIST" | while read -r filename; do
+	db_ls | grep -Fvxf "$VERSIONED_LIST" | while read -r filename; do
 		info "$filename -> /dev/null"
 		db_delete "$filename"
 		let removed_files_count=$removed_files_count+1
@@ -160,9 +161,10 @@ function meta_diff() {
 		shift
 	fi
 
-	build_tree >/dev/null
+	[ -z "$GITMETAFS_DEV_MODE" ] && build_tree >/dev/null
 	git diff --exit-code "$@" -- "$DB_ABS_DIR" | INCLUDE_TREE_DIFF=$include_tree_diff perl -MMIME::Base64 -e '
-		my $filename, $print, $print_override = $ENV{"INCLUDE_TREE_DIFF"};
+		my $filename, $print, $print_override = $ENV{"INCLUDE_TREE_DIFF"},
+		   $has_diff = 0;
 		while (<>) {
 			if ($_ =~ /^(---|\+\+\+) .*\/(.*)/) {
 				if ($1 eq "---") {
@@ -180,17 +182,19 @@ function meta_diff() {
 					}
 
 					if ($print || $print_override) {
-						print "/" . decode_base64($filename);
+						print decode_base64($filename);
 					}
 				}
 			} elsif ($_ =~ /^(-|\+)/) {
 				if ($print || $print_override) {
 					print $_;
+					$has_diff = 1;
 				}
 			}
-		}' | $PAGER
+		}
+		exit $has_diff;' | $PAGER
 
-	return ${PIPESTATUS[0]}
+	return ${PIPESTATUS[1]}
 }
 
 function write_hook() {
