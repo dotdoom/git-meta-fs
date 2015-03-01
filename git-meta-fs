@@ -142,8 +142,10 @@ function meta_merge() {
 		else
 			filename="$GIT_ROOT/$filename"
 			if [ -e "$filename" ]; then
-				chmod ${filemode/ */} "$filename"
-				chown ${filemode/* /} "$filename"
+				if [ ! -L "$filename" ]; then
+					chmod ${filemode/ */} "$filename"
+					chown ${filemode/* /} "$filename"
+				fi
 			else
 				die "No file for $filename ($filemode)"
 			fi
